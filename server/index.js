@@ -1,11 +1,14 @@
 import { WebSocketServer, WebSocket } from "ws";
-import { Rooms, broadcast, CLOSE_INVALID } from "./rooms.js";
+import { Rooms, broadcast, CLOSE_INVALID, CLOSE_FULL, MAX_CLIENTS } from "./rooms.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const HOST = process.env.HOST ?? "127.0.0.1";
+// LOG_LEVEL=debug also logs heartbeats and pings.
+const DEBUG = process.env.LOG_LEVEL === "debug";
 const LIVENESS_INTERVAL_MS = 30000;
 
 const RELAYED_TYPES = new Set(["control", "heartbeat", "adBreak", "buffering", "contentChanged"]);
+const CLOSE_REASONS = { [CLOSE_INVALID]: "geçersiz oda/istemci", [CLOSE_FULL]: `oda dolu (${MAX_CLIENTS})` };
 
 // Monotonic clock: an NTP step during a ping exchange would corrupt client offsets with Date.now().
 // Absolute accuracy is irrelevant, only consistency over the process lifetime.
@@ -13,13 +16,54 @@ const now = () => Number(process.hrtime.bigint() / 1000000n);
 
 const rooms = new Rooms();
 const wss = new WebSocketServer({ host: HOST, port: PORT, maxPayload: 16 * 1024 });
+let nextConnectionId = 1;
 
 const send = (ws, message) => {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
 };
 
-wss.on("connection", (ws) => {
+function log(...args) {
+  const time = new Date().toLocaleTimeString("tr-TR", { hour12: false });
+  console.log(`[${time}]`, ...args);
+}
+
+// "#3 1a2b3c4d" — connection number plus the start of the client id.
+const who = (ws) => `#${ws.connectionId}${ws.clientId ? ` ${ws.clientId.slice(0, 8)}` : ""}`;
+
+function describeRoom(roomId, room) {
+  const members = [...room.clients].map((ws) => (room.host === ws ? `${who(ws)} (host)` : who(ws)));
+  return `oda ${roomId} [${room.clients.size}/${MAX_CLIENTS}]: ${members.join(", ")}`;
+}
+
+function logSummary() {
+  log(`özet: ${wss.clients.size} bağlantı, ${rooms.size} oda`);
+  for (const [roomId, room] of rooms.entries()) log(`  ${describeRoom(roomId, room)}`);
+}
+
+function describeMessage(msg) {
+  const pos = typeof msg.position === "number" ? ` @ ${msg.position.toFixed(2)} sn` : "";
+  switch (msg.type) {
+    case "control":
+      return `control ${msg.action}${pos}${msg.playing === undefined ? "" : msg.playing ? " (oynuyor)" : " (duraklatıldı)"}`;
+    case "heartbeat":
+      return `heartbeat${pos} ${msg.playing ? "oynuyor" : "duraklatıldı"}${msg.fromHost ? " (host)" : ""}`;
+    case "adBreak":
+      return `reklam ${msg.active ? "başladı" : "bitti"}`;
+    case "buffering":
+      return `buffer ${msg.active ? "boşaldı" : "doldu"}`;
+    case "contentChanged":
+      return `içerik ${msg.contentId} (${msg.duration} sn)`;
+    default:
+      return msg.type;
+  }
+}
+
+wss.on("connection", (ws, req) => {
+  ws.connectionId = nextConnectionId++;
   ws.isAlive = true;
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0].trim() ?? req.socket.remoteAddress;
+  log(`${who(ws)} bağlandı (${ip}), toplam ${wss.clients.size} bağlantı`);
+
   ws.on("pong", () => {
     ws.isAlive = true;
   });
@@ -30,26 +74,39 @@ wss.on("connection", (ws) => {
     try {
       msg = JSON.parse(raw);
     } catch {
+      log(`${who(ws)} bozuk JSON gönderdi`);
       return;
     }
     if (!msg || typeof msg !== "object") return;
 
     if (msg.type === "ping") {
+      if (DEBUG) log(`${who(ws)} ping`);
       return send(ws, { type: "pong", t0: msg.t0, t1: now() });
     }
 
     if (msg.type === "join") {
-      if (ws.roomId) return;
+      if (ws.roomId) {
+        log(`${who(ws)} zaten ${ws.roomId} odasında, ikinci join yok sayıldı`);
+        return;
+      }
       if (typeof msg.clientId !== "string" || msg.clientId.length === 0 || msg.clientId.length > 64) {
+        log(`${who(ws)} reddedildi: geçersiz clientId`);
         return ws.close(CLOSE_INVALID);
       }
-      const { room, error } = rooms.join(ws, msg.roomId);
-      if (error) return ws.close(error);
+      const { room, created, error } = rooms.join(ws, msg.roomId);
+      if (error) {
+        log(`${who(ws)} ${JSON.stringify(msg.roomId)} odasına giremedi: ${CLOSE_REASONS[error]}`);
+        return ws.close(error);
+      }
       ws.roomId = msg.roomId;
       ws.clientId = msg.clientId;
+      const isHost = room.host === ws;
+      if (created) log(`oda oluşturuldu: ${ws.roomId}`);
+      log(`${who(ws)} ${ws.roomId} odasına katıldı${isHost ? " (host)" : ""}${room.state ? ", oda durumu gönderildi" : ""}`);
+      log(`  ${describeRoom(ws.roomId, room)}`);
       send(ws, {
         type: "joined",
-        isHost: room.host === ws,
+        isHost,
         hostId: room.host.clientId,
         peers: room.clients.size,
         state: room.state,
@@ -64,15 +121,34 @@ wss.on("connection", (ws) => {
     }
 
     const room = rooms.get(ws.roomId);
-    if (!room || !RELAYED_TYPES.has(msg.type)) return;
+    if (!room) {
+      log(`${who(ws)} odaya girmeden ${msg.type} gönderdi, yok sayıldı`);
+      return;
+    }
+    if (!RELAYED_TYPES.has(msg.type)) {
+      log(`${who(ws)} bilinmeyen mesaj: ${msg.type}`);
+      return;
+    }
+    if (msg.type !== "heartbeat" || DEBUG) {
+      log(`${who(ws)} → ${ws.roomId}: ${describeMessage(msg)} (${room.clients.size - 1} kişiye)`);
+    }
     // Keep the latest state so a late joiner can sync in one step. Only the host's heartbeats count.
     if (msg.type === "control" || (msg.type === "heartbeat" && room.host === ws)) room.state = msg;
     broadcast(room, raw.toString(), ws);
   });
 
-  ws.on("close", () => {
-    const room = rooms.leave(ws);
-    if (!room) return;
+  ws.on("close", (code) => {
+    const reason = CLOSE_REASONS[code] ? `, ${CLOSE_REASONS[code]}` : "";
+    const left = rooms.leave(ws);
+    log(`${who(ws)} ayrıldı (kod ${code}${reason}), toplam ${wss.clients.size} bağlantı`);
+    if (!left) return;
+    const { room, deleted, hostChanged } = left;
+    if (deleted) {
+      log(`oda kapandı: ${ws.roomId} (boş kaldı), toplam ${rooms.size} oda`);
+      return;
+    }
+    if (hostChanged) log(`${ws.roomId} odasının yeni host'u: ${who(room.host)}`);
+    log(`  ${describeRoom(ws.roomId, room)}`);
     broadcast(
       room,
       JSON.stringify({ type: "peerLeft", clientId: ws.clientId, peers: room.clients.size, hostId: room.host.clientId }),
@@ -83,13 +159,15 @@ wss.on("connection", (ws) => {
 const liveness = setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws.isAlive) {
+      log(`${who(ws)} ping'e yanıt vermedi, bağlantı kesiliyor`);
       ws.terminate();
       continue;
     }
     ws.isAlive = false;
     ws.ping();
   }
+  if (wss.clients.size > 0) logSummary();
 }, LIVENESS_INTERVAL_MS);
 
 wss.on("close", () => clearInterval(liveness));
-wss.on("listening", () => console.log(`PrimeCatParty sync server listening on ws://${HOST}:${PORT}`));
+wss.on("listening", () => log(`PrimeCatParty sync sunucusu ws://${HOST}:${PORT} adresinde dinliyor${DEBUG ? " (debug)" : ""}`));
