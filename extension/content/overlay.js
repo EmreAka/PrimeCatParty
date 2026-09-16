@@ -46,14 +46,103 @@
     .warning { color: #ffca28; }
   `;
 
+  const TOAST_STYLE = `
+    :host {
+      all: initial;
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 2147483647;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .toast {
+      font: 600 22px/1.3 system-ui, sans-serif;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.78);
+      padding: 12px 22px;
+      border-radius: 12px;
+      text-align: center;
+      max-width: 70vw;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+    }
+    .toast.visible { opacity: 1; }
+  `;
+
+  const TOAST_DURATION_MS = 2500;
+  const TOAST_LIMIT = 3;
+
+  // Fullscreen hides everything outside the fullscreen element, so follow it there.
+  function mountTarget() {
+    const fullscreen = document.fullscreenElement;
+    return fullscreen && fullscreen.tagName !== "VIDEO" ? fullscreen : document.body;
+  }
+
+  function createShadowHost(tag, css) {
+    const host = document.createElement(tag);
+    const root = host.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = css;
+    root.append(style);
+    return { host, root };
+  }
+
+  class Toasts {
+    #host = null;
+    #root = null;
+
+    constructor() {
+      document.addEventListener("fullscreenchange", () => {
+        if (this.#host?.isConnected) this.#mount();
+      });
+    }
+
+    show(text) {
+      if (!this.#host) ({ host: this.#host, root: this.#root } = createShadowHost("primecatparty-toast", TOAST_STYLE));
+      this.#mount();
+
+      const toasts = this.#root.querySelectorAll(".toast");
+      if (toasts.length >= TOAST_LIMIT) toasts[0].remove();
+
+      const toast = document.createElement("div");
+      toast.className = "toast";
+      toast.textContent = text;
+      this.#root.append(toast);
+      requestAnimationFrame(() => toast.classList.add("visible"));
+      setTimeout(() => {
+        toast.classList.remove("visible");
+        setTimeout(() => {
+          toast.remove();
+          if (!this.#root.querySelector(".toast")) this.#host.remove();
+        }, 300);
+      }, TOAST_DURATION_MS);
+    }
+
+    #mount() {
+      const parent = mountTarget();
+      if (parent && this.#host.parentNode !== parent) parent.append(this.#host);
+    }
+  }
+
   class Overlay {
     #host = null;
     #box = null;
     #enabled = true;
     #state = null;
+    #toasts = new Toasts();
 
     constructor() {
       document.addEventListener("fullscreenchange", () => this.#render());
+    }
+
+    notify(text) {
+      PCP.log(`bildirim: ${text}`);
+      this.#toasts.show(text);
     }
 
     setEnabled(enabled) {
@@ -81,7 +170,8 @@
       const rows = [row(dot, `${label}${state.detail ? ` (${state.detail})` : ""} · ${state.roomId}`)];
 
       if (state.connection === "connected") {
-        rows.push(row(`${state.peers} kişi · ${state.isHost ? "host" : "misafir"}`));
+        const names = state.members.length ? `: ${state.members.join(", ")}` : "";
+        rows.push(row(`${state.peers} kişi${names} · ${state.isHost ? "host" : "misafir"}`));
       }
       if (state.driftMs !== null) {
         const sign = state.driftMs > 0 ? "+" : "";
@@ -98,17 +188,13 @@
 
     #mount() {
       if (!this.#host) {
-        this.#host = document.createElement("primecatparty-overlay");
-        const root = this.#host.attachShadow({ mode: "closed" });
-        const style = document.createElement("style");
-        style.textContent = STYLE;
+        const { host, root } = createShadowHost("primecatparty-overlay", STYLE);
+        this.#host = host;
         this.#box = document.createElement("div");
         this.#box.className = "box";
-        root.append(style, this.#box);
+        root.append(this.#box);
       }
-      // Fullscreen hides everything outside the fullscreen element, so follow it there.
-      const fullscreen = document.fullscreenElement;
-      const parent = fullscreen && fullscreen.tagName !== "VIDEO" ? fullscreen : document.body;
+      const parent = mountTarget();
       if (parent && this.#host.parentNode !== parent) parent.append(this.#host);
     }
   }

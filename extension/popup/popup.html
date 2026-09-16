@@ -125,6 +125,12 @@
         display: block;
         margin-top: 8px;
       }
+      label.name {
+        margin: 0 0 12px;
+      }
+      label.name input {
+        margin-top: 4px;
+      }
       .frame {
         margin-top: 10px;
         font-size: 11px;
@@ -154,6 +160,11 @@
   </head>
   <body>
     <h1>PrimeCatParty</h1>
+
+    <label class="name">
+      Adın
+      <input id="display-name" type="text" class="full" maxlength="32" placeholder="ör. Emre" autocomplete="off" />
+    </label>
 
     <section id="not-prime" hidden>
       <p class="muted">Bir Prime Video sekmesi açıp tekrar dene.</p>
@@ -194,6 +205,7 @@
         Sunucu adresi
         <input id="server-url" type="text" class="full" spellcheck="false" />
       </label>
+      <label><input id="notifications" type="checkbox" /> Ekranda bildirimler (ör. "Emre durdurdu")</label>
       <label><input id="overlay" type="checkbox" /> Sayfada durum göstergesi</label>
     </details>
 

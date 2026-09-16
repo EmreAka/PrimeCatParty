@@ -10,10 +10,13 @@
   const SCAN_THROTTLE_MS = 150;
   const RATE_EPSILON = 1e-3;
   const DEEP_SCAN_INTERVAL_MS = 3000;
+  // Prime's player reverts play()/pause() called on the element, so prefer its own button.
+  const PLAY_PAUSE_SELECTORS = [".atvwebplayersdk-playpause-button", "button[class*='playpause' i]"];
 
   const VIDEO_EVENTS = [
     "play",
     "pause",
+    "seeking",
     "seeked",
     "ratechange",
     "ended",
@@ -123,6 +126,30 @@
         this.#shadowVideos = collectShadowVideos(document.documentElement);
       }
       return this.#shadowVideos.filter((video) => video.isConnected);
+    }
+
+    // Returns the method actually used: "button" (Prime's UI) or "element" (HTMLMediaElement API).
+    setPlaying(playing, preferred = "button") {
+      if (!this.video) return null;
+      const button = preferred === "button" ? this.findPlayPauseButton() : null;
+      if (button) {
+        button.click();
+        return "button";
+      }
+      if (playing) this.play();
+      else this.pause();
+      return "element";
+    }
+
+    findPlayPauseButton() {
+      const roots = this.video ? [this.video.getRootNode(), document] : [document];
+      for (const root of roots) {
+        for (const selector of PLAY_PAUSE_SELECTORS) {
+          const button = root.querySelector?.(selector);
+          if (button) return button;
+        }
+      }
+      return null;
     }
 
     play() {

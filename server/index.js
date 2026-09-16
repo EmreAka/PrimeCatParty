@@ -27,8 +27,17 @@ function log(...args) {
   console.log(`[${time}]`, ...args);
 }
 
-// "#3 1a2b3c4d" — connection number plus the start of the client id.
-const who = (ws) => `#${ws.connectionId}${ws.clientId ? ` ${ws.clientId.slice(0, 8)}` : ""}`;
+const MAX_NAME_LENGTH = 32;
+
+// "#3 emre (1a2b3c4d)" — connection number, display name, start of the client id.
+function who(ws) {
+  if (!ws.clientId) return `#${ws.connectionId}`;
+  return `#${ws.connectionId} ${ws.name || "isimsiz"} (${ws.clientId.slice(0, 8)})`;
+}
+
+const cleanName = (name) => (typeof name === "string" ? name.trim().slice(0, MAX_NAME_LENGTH) : "");
+
+const membersOf = (room) => [...room.clients].map((ws) => ({ clientId: ws.clientId, name: ws.name }));
 
 function describeRoom(roomId, room) {
   const members = [...room.clients].map((ws) => (room.host === ws ? `${who(ws)} (host)` : who(ws)));
@@ -100,6 +109,7 @@ wss.on("connection", (ws, req) => {
       }
       ws.roomId = msg.roomId;
       ws.clientId = msg.clientId;
+      ws.name = cleanName(msg.name);
       const isHost = room.host === ws;
       if (created) log(`oda oluşturuldu: ${ws.roomId}`);
       log(`${who(ws)} ${ws.roomId} odasına katıldı${isHost ? " (host)" : ""}${room.state ? ", oda durumu gönderildi" : ""}`);
@@ -109,12 +119,20 @@ wss.on("connection", (ws, req) => {
         isHost,
         hostId: room.host.clientId,
         peers: room.clients.size,
+        members: membersOf(room),
         state: room.state,
         t1: now(),
       });
       broadcast(
         room,
-        JSON.stringify({ type: "peerJoined", clientId: ws.clientId, peers: room.clients.size, hostId: room.host.clientId }),
+        JSON.stringify({
+          type: "peerJoined",
+          clientId: ws.clientId,
+          name: ws.name,
+          peers: room.clients.size,
+          hostId: room.host.clientId,
+          members: membersOf(room),
+        }),
         ws,
       );
       return;
@@ -123,6 +141,14 @@ wss.on("connection", (ws, req) => {
     const room = rooms.get(ws.roomId);
     if (!room) {
       log(`${who(ws)} odaya girmeden ${msg.type} gönderdi, yok sayıldı`);
+      return;
+    }
+
+    if (msg.type === "rename") {
+      const previous = ws.name || "isimsiz";
+      ws.name = cleanName(msg.name);
+      log(`#${ws.connectionId} ismini değiştirdi: ${previous} → ${ws.name || "isimsiz"}`);
+      broadcast(room, JSON.stringify({ type: "members", members: membersOf(room), hostId: room.host.clientId }));
       return;
     }
     if (!RELAYED_TYPES.has(msg.type)) {
@@ -151,7 +177,14 @@ wss.on("connection", (ws, req) => {
     log(`  ${describeRoom(ws.roomId, room)}`);
     broadcast(
       room,
-      JSON.stringify({ type: "peerLeft", clientId: ws.clientId, peers: room.clients.size, hostId: room.host.clientId }),
+      JSON.stringify({
+        type: "peerLeft",
+        clientId: ws.clientId,
+        name: ws.name,
+        peers: room.clients.size,
+        hostId: room.host.clientId,
+        members: membersOf(room),
+      }),
     );
   });
 });

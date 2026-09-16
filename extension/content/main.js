@@ -7,19 +7,30 @@
 
   const { Transport, ClockSync, DriftController, Player, Overlay, expectedPosition, log } = PCP;
 
-  const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true };
+  const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true, notifications: true, displayName: "" };
   // Time window, not a flag: `seeked` can arrive 200-300 ms after a remote seek is applied.
   const SUPPRESS_MS = 400;
+  // After we play/pause on someone's behalf, Prime may revert it. Within this window, play/pause
+  // events are ours (never broadcast) and a revert is re-applied.
+  const PLAY_INTENT_MS = 2500;
+  const PLAY_VERIFY_MS = 700;
+  const MAX_PLAY_ATTEMPTS = 3;
+  const STATE_FIX_GAP_MS = 5000;
   const HEARTBEAT_MS = 3000;
-  // Local controls wait this long so ad transitions (pause/seek fired before the ad is detected) can be dropped.
-  const LOCAL_SEND_DELAY_MS = 400;
+  // Local events are grouped until the player is quiet this long (also lets ad transitions be detected first).
+  const LOCAL_SETTLE_MS = 400;
+  const LOCAL_BURST_TICK_MS = 100;
+  const SEEK_RESUME_WAIT_MS = 2500;
+  // A remote seek suppresses local events until `seeked` (at most MAX), plus a tail for Prime's resume.
+  const REMOTE_SEEK_MAX_MS = 4000;
+  const REMOTE_SEEK_TAIL_MS = 1000;
   const AD_EXIT_GRACE_MS = 1500;
   const CONTROL_GRACE_MS = 1500;
   const VIDEO_LOST_GRACE_MS = 15000;
   const BUFFER_REPORT_DELAY_MS = 500;
   const CONTENT_CHECK_MS = 1000;
   const DURATION_TOLERANCE_S = 2;
-  const CONTROL_ACTIONS = { play: "play", pause: "pause", seeked: "seek", ratechange: "rate" };
+  const LOCAL_CONTROL_EVENTS = new Set(["play", "pause", "seeking", "seeked", "ratechange"]);
 
   const clientId = crypto.randomUUID();
   let settings = { ...DEFAULT_SETTINGS };
@@ -27,6 +38,9 @@
   let transport = null;
   let session = newSession();
   let suppressUntil = 0;
+  let playIntent = null; // { playing, until, attempts }
+  let remoteSeekUntil = 0;
+  let localBurst = null;
   let adEndedAt = -Infinity;
   let localContent = null;
   let lostTimer = null;
@@ -44,7 +58,7 @@
     player,
     clock,
     canCorrect: () => canFollowHost() && !player.video.paused,
-    hardSeek: (position) => applyRemote(() => player.seekTo(position)),
+    hardSeek: (position) => seekFromRemote(position),
   });
   const overlay = new Overlay();
 
@@ -98,6 +112,8 @@
       isHost: false,
       hostId: null,
       peers: 0,
+      members: new Map(), // clientId -> name
+      lastStateFix: -Infinity,
       pendingState: null,
       needsInitialHeartbeat: false,
       remoteAds: new Set(),
@@ -119,6 +135,14 @@
     if (changes.overlay) {
       settings.overlay = changes.overlay.newValue ?? DEFAULT_SETTINGS.overlay;
       overlay.setEnabled(settings.overlay);
+    }
+    if (changes.notifications) {
+      settings.notifications = changes.notifications.newValue ?? DEFAULT_SETTINGS.notifications;
+    }
+    if (changes.displayName) {
+      settings.displayName = changes.displayName.newValue ?? "";
+      log(`isim: ${myName()}`);
+      if (session.joined) transport.send({ type: "rename", name: myName() });
     }
     if (changes.serverUrl) {
       settings.serverUrl = changes.serverUrl.newValue || DEFAULT_SETTINGS.serverUrl;
@@ -168,6 +192,7 @@
     clock.stop();
     drift.reset();
     clearTimeout(bufferTimer);
+    cancelLocalBurst();
     session = newSession();
   }
 
@@ -179,7 +204,7 @@
 
   function onOpen() {
     endSession();
-    transport.send({ type: "join", roomId, clientId });
+    transport.send({ type: "join", roomId, clientId, name: myName() });
     // Never trust an offset from a previous connection.
     clock.start();
   }
@@ -194,6 +219,9 @@
         return onPeerJoined(msg);
       case "peerLeft":
         return onPeerLeft(msg);
+      case "members":
+        updateMembers(msg.members);
+        return report();
       case "control":
         return onRemoteControl(msg);
       case "heartbeat":
@@ -216,8 +244,11 @@
       pendingState: msg.state ?? null,
       needsInitialHeartbeat: !msg.state,
     });
+    updateMembers(msg.members);
     clock.seed(msg.t1);
     log(`odaya katılındı: ${msg.peers} kişi, ${msg.isHost ? "host" : "misafir"}`);
+    const others = [...session.members].filter(([id]) => id !== clientId).map(([, name]) => name);
+    notify(others.length ? `Odaya katıldın · ${others.join(", ")} burada` : "Oda hazır, arkadaşını bekliyorsun");
     checkContent(true);
     announceLocalHolds();
     if (clock.ready) afterClockSync();
@@ -241,32 +272,64 @@
   function onPeerJoined(msg) {
     session.peers = msg.peers;
     session.hostId = msg.hostId ?? session.hostId;
-    log(`katılımcı geldi (${msg.peers} kişi)`);
+    updateMembers(msg.members);
+    const name = nameOf(msg.clientId, msg.name);
+    log(`katılımcı geldi: ${name} (${msg.peers} kişi)`);
+    notify(`${name} odaya katıldı`);
     checkContent(true);
     announceLocalHolds();
     report();
   }
 
   function onPeerLeft(msg) {
+    const name = nameOf(msg.clientId, msg.name);
     session.peers = msg.peers;
     session.hostId = msg.hostId ?? session.hostId;
+    updateMembers(msg.members);
     const wasHost = session.isHost;
     session.isHost = session.hostId === clientId;
+    for (const collection of [session.remoteAds, session.remoteBuffering, session.peerContent, session.peerDrift]) {
+      collection.delete(msg.clientId);
+    }
+    log(`katılımcı ayrıldı: ${name} (${msg.peers} kişi)`);
+    notify(`${name} ayrıldı`);
     if (session.isHost && !wasHost) {
       log("host artık bu sekme");
       drift.reset();
     }
-    for (const collection of [session.remoteAds, session.remoteBuffering, session.peerContent, session.peerDrift]) {
-      collection.delete(msg.clientId);
-    }
-    log(`katılımcı ayrıldı (${msg.peers} kişi)`);
     resumeIfClear();
     report();
   }
 
+  function updateMembers(members) {
+    if (!Array.isArray(members)) return;
+    session.members = new Map(members.map((m) => [m.clientId, m.name || "İsimsiz"]));
+  }
+
+  function nameOf(id, fallback) {
+    return session.members.get(id) || fallback || "Biri";
+  }
+
+  function myName() {
+    return settings.displayName.trim().slice(0, 32);
+  }
+
+  function notify(text) {
+    if (settings.notifications) overlay.notify(text);
+    else log(`bildirim (kapalı): ${text}`);
+  }
+
+  function formatTime(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = String(total % 60).padStart(2, "0");
+    return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+  }
+
   // Tell newcomers about ad/buffer pauses they would otherwise never hear about.
   function announceLocalHolds() {
-    if (player.adActive) transport?.send({ type: "adBreak", clientId, active: true });
+    if (player.adActive) transport?.send({ type: "adBreak", clientId, name: myName(), active: true });
     if (session.bufferingReported) transport?.send({ type: "buffering", clientId, active: true });
   }
 
@@ -278,15 +341,23 @@
   }
 
   function onRemoteControl(msg) {
-    log(`uzak ${msg.action} @ ${Number(msg.position).toFixed(2)}`);
+    const name = nameOf(msg.clientId, msg.name);
+    log(`uzak ${msg.action} (${name}) @ ${Number(msg.position).toFixed(2)}`);
+    const text = {
+      play: `${name} devam ettirdi`,
+      pause: `${name} durdurdu`,
+      seek: `${name} ${formatTime(msg.position)} konumuna sardı`,
+      rate: `${name} hızı ${msg.rate}x yaptı`,
+    }[msg.action];
+    if (text) notify(text);
     if (!contentMatches(msg.clientId)) {
       log("farklı içerik, komut yok sayıldı");
       return;
     }
-    applyControl(msg);
+    applyControl(msg, `${name} ${msg.action}`);
   }
 
-  function applyControl(state) {
+  function applyControl(state, reason = "uzak komut") {
     const video = player.video;
     if (!video || !clock.usable) return;
     if (player.adActive) {
@@ -300,20 +371,55 @@
 
     const target = expectedPosition(state, clock.now());
     const hold = state.playing && (session.remoteAds.size > 0 || session.remoteBuffering.size > 0);
+    if (state.rate > 0) applyRemote(() => player.setBaseRate(state.rate));
+    const threshold = state.action === "seek" ? 0.05 : 0.5;
+    if (Math.abs(video.currentTime - target) > threshold) {
+      log(`${reason}: ${video.currentTime.toFixed(2)} → ${target.toFixed(2)} konumuna sarılıyor`);
+      seekFromRemote(target);
+    }
+    session.autoPaused = hold;
+    setPlaying(state.playing && !hold, reason);
+  }
+
+  // Drives Prime into the wanted play state and keeps it there for PLAY_INTENT_MS.
+  function setPlaying(playing, reason) {
+    const video = player.video;
+    if (!video) return;
+    if (video.paused !== playing) {
+      // Already there; drop an older opposite intent so it doesn't fight this state.
+      if (playIntent && playIntent.playing !== playing) playIntent = null;
+      return;
+    }
+    playIntent = { playing, until: performance.now() + PLAY_INTENT_MS, attempts: 0 };
+    attemptPlaying(reason);
+  }
+
+  function attemptPlaying(reason) {
+    const intent = playIntent;
+    const video = player.video;
+    if (!intent || !video || performance.now() > intent.until) return;
+    const wanted = intent.playing ? "oynat" : "durdur";
+    if (video.paused !== intent.playing) {
+      if (intent.attempts > 0 && !intent.confirmed) log(`${wanted} tuttu (${intent.attempts}. denemede)`);
+      intent.confirmed = true;
+      return;
+    }
+    intent.confirmed = false;
+    if (intent.attempts >= MAX_PLAY_ATTEMPTS) {
+      log(`player "${wanted}" komutunu ${MAX_PLAY_ATTEMPTS} denemede uygulamadı, vazgeçildi`);
+      return;
+    }
+    // Alternate between Prime's button and the element API in case one of them is ignored.
+    const preferred = intent.attempts % 2 === 0 ? "button" : "element";
+    intent.attempts += 1;
+    let method;
     applyRemote(() => {
-      if (state.rate > 0) player.setBaseRate(state.rate);
-      const threshold = state.action === "seek" ? 0.05 : 0.5;
-      if (Math.abs(video.currentTime - target) > threshold) {
-        player.seekTo(target);
-        drift.markHardSeek();
-      }
-      session.autoPaused = hold;
-      if (state.playing && !hold) {
-        if (video.paused) player.play();
-      } else if (!video.paused) {
-        player.pause();
-      }
+      method = player.setPlaying(intent.playing, preferred);
     });
+    log(`${reason}: ${wanted} (${method === "button" ? "Prime butonu" : "video elementi"}, deneme ${intent.attempts})`);
+    setTimeout(() => {
+      if (playIntent === intent) attemptPlaying("doğrulama");
+    }, PLAY_VERIFY_MS);
   }
 
   function canFollowHost() {
@@ -362,12 +468,17 @@
     if (msg.at <= session.lastControlAt || !canFollowHost() || !contentMatches(msg.clientId)) return;
     const video = player.video;
     if (msg.playing === video.paused) {
-      log("oynatma durumu host ile uyuşmuyor, düzeltiliyor");
-      applyControl(msg);
+      // Rate-limited so a player that keeps reverting can't cause a seek-back loop.
+      if (performance.now() - session.lastStateFix < STATE_FIX_GAP_MS) return;
+      session.lastStateFix = performance.now();
+      log(`oynatma durumu host ile uyuşmuyor (host ${msg.playing ? "oynuyor" : "duraklatmış"}), düzeltiliyor`);
+      applyControl(msg, "host durumu");
     } else if (msg.playing) {
       drift.update(msg);
     } else if (Math.abs(video.currentTime - msg.position) > 0.5) {
-      applyControl(msg);
+      if (performance.now() - session.lastStateFix < STATE_FIX_GAP_MS) return;
+      session.lastStateFix = performance.now();
+      applyControl(msg, "host konumu");
     }
   }
 
@@ -399,39 +510,104 @@
     if (video !== player.video || !session.joined) return;
     if (type === "waiting") return onWaiting();
     if (type === "canplay" || type === "playing") onBufferRecovered();
+    if ((type === "play" || type === "pause") && playIntent && performance.now() < playIntent.until) {
+      if (video.paused === playIntent.playing) {
+        log(`player durumu geri aldı (${type}), yeniden uygulanıyor`);
+        attemptPlaying("geri alındı");
+      }
+      return;
+    }
     if (type === "play" && performance.now() - adEndedAt < AD_EXIT_GRACE_MS && hasRemoteHolds()) {
       return holdPlayback();
     }
-    const action = CONTROL_ACTIONS[type];
-    if (!action || internal || performance.now() < suppressUntil) return;
-    queueLocalControl(action, video);
+    if (!LOCAL_CONTROL_EVENTS.has(type) || internal) return;
+    const now = performance.now();
+    // Prime wraps a seek in pause/play; while our remote seek settles, none of that is the user's doing.
+    if (now < remoteSeekUntil) {
+      if (type === "seeked") remoteSeekUntil = now + REMOTE_SEEK_TAIL_MS;
+      return;
+    }
+    if (now < suppressUntil) return;
+    if (player.adActive || now - adEndedAt < AD_EXIT_GRACE_MS) return;
+    if (type === "ratechange") return sendLocalControl("rate", video);
+    recordLocalEvent(type, video);
   }
 
-  function queueLocalControl(action, video) {
-    if (player.adActive || !clock.usable || performance.now() - adEndedAt < AD_EXIT_GRACE_MS) return;
+  // A user seek on Prime fires pause → seeking → seeked → play. Collect such bursts and send one
+  // control once the player settles: "seek" if the burst moved, otherwise play/pause if the state flipped.
+  function recordLocalEvent(type, video) {
+    const now = performance.now();
+    if (!localBurst) {
+      const startPlaying = type === "pause" ? true : type === "play" ? false : !video.paused;
+      localBurst = {
+        video,
+        session,
+        startPlaying,
+        sawSeek: false,
+        events: [],
+        lastEventAt: now,
+        timer: setInterval(checkLocalBurst, LOCAL_BURST_TICK_MS),
+      };
+    }
+    localBurst.events.push(type);
+    localBurst.lastEventAt = now;
+    if (type === "seeking" || type === "seeked") localBurst.sawSeek = true;
+    session.lastControlLocal = now;
+    drift.reset();
+  }
+
+  function checkLocalBurst() {
+    const burst = localBurst;
+    if (!burst) return;
+    const video = player.video;
+    if (burst.session !== session || burst.video !== video) return cancelLocalBurst();
+    if (video.seeking) return;
+    const idle = performance.now() - burst.lastEventAt;
+    if (idle < LOCAL_SETTLE_MS) return;
+    // Seeking while playing: Prime resumes on its own once buffered, so wait for that play.
+    if (burst.sawSeek && burst.startPlaying && video.paused && idle < SEEK_RESUME_WAIT_MS) return;
+
+    cancelLocalBurst();
+    const playing = !video.paused;
+    let action = null;
+    if (burst.sawSeek) action = "seek";
+    else if (playing !== burst.startPlaying) action = playing ? "play" : "pause";
+    log(`yerel olaylar [${burst.events.join(" → ")}] → ${action ?? "değişiklik yok, gönderilmedi"}`);
+    if (action) sendLocalControl(action, video);
+  }
+
+  function cancelLocalBurst() {
+    if (!localBurst) return;
+    clearInterval(localBurst.timer);
+    localBurst = null;
+  }
+
+  function sendLocalControl(action, video) {
+    if (!session.joined || player.adActive || !clock.usable) return;
+    if (performance.now() - adEndedAt < AD_EXIT_GRACE_MS) return;
     const control = {
       type: "control",
       action,
       clientId,
+      name: myName(),
       position: video.currentTime,
       playing: !video.paused,
       rate: player.baseRate,
       at: clock.now(),
     };
+    if (action !== "rate") session.autoPaused = false;
+    session.lastControlAt = control.at;
     session.lastControlLocal = performance.now();
     drift.reset();
+    log(`yerel ${action} gönderiliyor @ ${control.position.toFixed(2)} (${control.playing ? "oynuyor" : "duraklatılmış"})`);
+    transport?.send(control);
+    report();
+  }
 
-    const current = session;
-    setTimeout(() => {
-      if (session !== current || player.video !== video || player.adActive) return;
-      if (performance.now() - adEndedAt < AD_EXIT_GRACE_MS) return;
-      if (action === "play" || action === "pause") session.autoPaused = false;
-      session.lastControlAt = control.at;
-      session.lastControlLocal = performance.now();
-      log(`yerel ${action} gönderiliyor @ ${control.position.toFixed(2)}`);
-      transport?.send(control);
-      report();
-    }, LOCAL_SEND_DELAY_MS);
+  function seekFromRemote(position) {
+    remoteSeekUntil = performance.now() + REMOTE_SEEK_MAX_MS;
+    applyRemote(() => player.seekTo(position));
+    drift.markHardSeek();
   }
 
   // ---- Ads ----------------------------------------------------------------------
@@ -439,7 +615,7 @@
   function onAdChange(active) {
     if (!active) adEndedAt = performance.now();
     if (!session.joined) return report();
-    transport.send({ type: "adBreak", clientId, active });
+    transport.send({ type: "adBreak", clientId, name: myName(), active });
     drift.reset();
     if (!active) {
       if (hasRemoteHolds()) holdPlayback();
@@ -449,7 +625,9 @@
   }
 
   function onRemoteAd(msg) {
-    log(`uzak reklam ${msg.active ? "başladı" : "bitti"}`);
+    const name = nameOf(msg.clientId, msg.name);
+    log(`uzak reklam ${msg.active ? "başladı" : "bitti"} (${name})`);
+    notify(msg.active ? `${name} reklamda, bekleniyor` : `${name} reklamdan çıktı`);
     if (msg.active) {
       session.remoteAds.add(msg.clientId);
       holdPlayback();
@@ -511,14 +689,14 @@
     // During our own ad the element may be the ad itself; onAdChange re-holds when it ends.
     if (!video || player.adActive || video.paused) return;
     session.autoPaused = true;
-    applyRemote(() => player.pause());
+    setPlaying(false, "bekletme");
   }
 
   function resumeIfClear() {
     if (!session.autoPaused || player.adActive || hasRemoteHolds()) return;
     session.autoPaused = false;
     log("bekleme bitti, devam ediliyor");
-    applyRemote(() => player.play());
+    setPlaying(true, "bekleme bitti");
   }
 
   // ---- Content identity ----------------------------------------------------------
@@ -548,14 +726,21 @@
       log("içerik:", next);
     }
     if ((changed || force) && session.joined) {
-      transport.send({ type: "contentChanged", clientId, ...localContent });
+      transport.send({ type: "contentChanged", clientId, name: myName(), ...localContent });
     }
     if (changed) report();
   }
 
   function onRemoteContent(msg) {
-    session.peerContent.set(msg.clientId, { contentId: msg.contentId, duration: msg.duration });
-    if (!sameContent(msg, localContent)) log("diğer taraf başka bir bölüme geçti", msg);
+    const previous = session.peerContent.get(msg.clientId);
+    const next = { contentId: msg.contentId, duration: msg.duration };
+    session.peerContent.set(msg.clientId, next);
+    const changed = !previous || previous.contentId !== next.contentId || previous.duration !== next.duration;
+    if (changed && !sameContent(next, localContent)) {
+      const name = nameOf(msg.clientId, msg.name);
+      log(`${name} başka bir bölümde`, msg);
+      notify(`${name} başka bir bölüm izliyor`);
+    }
     report();
   }
 
@@ -579,6 +764,7 @@
       connection: transport ? transport.status : "idle",
       detail: transport?.detail ?? null,
       peers: session.peers,
+      members: [...session.members].map(([id, name]) => (id === clientId ? `${name} (sen)` : name)),
       isHost: session.isHost,
       driftMs: currentDriftMs(),
       rttMs: clock.rtt === null ? null : Math.round(clock.rtt),
@@ -647,6 +833,8 @@
       connection: transport?.status ?? "idle",
       detail: transport?.detail ?? null,
       hasVideo: Boolean(player.video),
+      name: myName(),
+      playPauseButton: Boolean(player.video && player.findPlayPauseButton()),
       videos,
       logs: PCP.logs.slice(-25),
     };

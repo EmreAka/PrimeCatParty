@@ -1,4 +1,4 @@
-const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true };
+const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true, notifications: true, displayName: "" };
 const PRIME_URL = /^https:\/\/www\.primevideo\.com\//;
 const ROOM_ID = /^[a-z0-9]{8}$/;
 
@@ -71,7 +71,8 @@ async function render() {
   $("room-code").textContent = roomId;
   $("connection").dataset.state = state;
   $("connection-label").textContent = label;
-  $("peers").textContent = connected ? String(status.peers) : "–";
+  const names = status?.members?.length ? ` · ${status.members.join(", ")}` : "";
+  $("peers").textContent = connected ? `${status.peers}${names}` : "–";
   $("role").textContent = connected ? (status.isHost ? "Host" : "Misafir") : "–";
   $("drift").textContent =
     connected && status.driftMs !== null ? `${status.driftMs > 0 ? "+" : ""}${status.driftMs} ms` : "–";
@@ -149,8 +150,26 @@ async function initSettings() {
   const settings = await chrome.storage.local.get(DEFAULT_SETTINGS);
   const serverInput = $("server-url");
   const overlayInput = $("overlay");
+  const notificationsInput = $("notifications");
+  const nameInput = $("display-name");
   serverInput.value = settings.serverUrl;
   overlayInput.checked = settings.overlay;
+  notificationsInput.checked = settings.notifications;
+  nameInput.value = settings.displayName;
+
+  let nameTimer = null;
+  const saveName = () => {
+    clearTimeout(nameTimer);
+    chrome.storage.local.set({ displayName: nameInput.value.trim() });
+  };
+  nameInput.addEventListener("input", () => {
+    clearTimeout(nameTimer);
+    nameTimer = setTimeout(saveName, 500);
+  });
+  nameInput.addEventListener("change", saveName);
+  notificationsInput.addEventListener("change", () =>
+    chrome.storage.local.set({ notifications: notificationsInput.checked }),
+  );
 
   serverInput.addEventListener("change", () => {
     const value = serverInput.value.trim();
