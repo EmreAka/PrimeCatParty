@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "PrimeCatParty",
+  "version": "0.1.0",
+  "description": "Prime Video'yu arkadaşlarınla senkron izle.",
+  "host_permissions": ["https://www.primevideo.com/*"],
+  "permissions": ["storage", "tabs", "scripting"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "PrimeCatParty",
+    "default_popup": "popup/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.primevideo.com/*"],
+      "js": [
+        "content/debug.js",
+        "content/transport.js",
+        "content/sync.js",
+        "content/player.js",
+        "content/overlay.js",
+        "content/main.js"
+      ],
+      "all_frames": true,
+      "match_origin_as_fallback": true,
+      "run_at": "document_idle"
+    }
+  ]
+}

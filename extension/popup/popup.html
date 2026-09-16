@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <title>PrimeCatParty</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --accent: #1a98ff;
+        --muted: #888;
+        --ok: #2e7d32;
+        --warn: #f9a825;
+        --err: #c62828;
+      }
+      body {
+        width: 280px;
+        margin: 0;
+        padding: 14px;
+        font: 13px/1.4 system-ui, sans-serif;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 12px;
+      }
+      button {
+        font: inherit;
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid #8886;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button.danger {
+        color: var(--err);
+        border-color: currentColor;
+      }
+      input[type="text"] {
+        font: inherit;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid #8886;
+        background: transparent;
+        color: inherit;
+        min-width: 0;
+        box-sizing: border-box;
+      }
+      input:invalid {
+        border-color: var(--err);
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .row > input {
+        flex: 1;
+      }
+      .full {
+        width: 100%;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .or {
+        text-align: center;
+        margin: 10px 0;
+      }
+      .code {
+        flex: 1;
+        font: 600 20px/1 ui-monospace, monospace;
+        letter-spacing: 2px;
+      }
+      .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 6px;
+        background: var(--muted);
+      }
+      #connection[data-state="connected"] .dot {
+        background: var(--ok);
+      }
+      #connection[data-state="connecting"] .dot,
+      #connection[data-state="reconnecting"] .dot {
+        background: var(--warn);
+      }
+      #connection[data-state="error"] .dot,
+      #connection[data-state="disconnected"] .dot {
+        background: var(--err);
+      }
+      dl {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 4px 10px;
+        margin: 12px 0;
+      }
+      dt {
+        color: var(--muted);
+      }
+      dd {
+        margin: 0;
+      }
+      .warnings {
+        color: var(--warn);
+        margin: 0 0 12px;
+        padding-left: 18px;
+      }
+      .error {
+        color: var(--err);
+        margin: 6px 0 0;
+      }
+      details {
+        margin-top: 14px;
+        border-top: 1px solid #8883;
+        padding-top: 10px;
+      }
+      label {
+        display: block;
+        margin-top: 8px;
+      }
+      .frame {
+        margin-top: 10px;
+        font-size: 11px;
+      }
+      .frame ul {
+        margin: 4px 0;
+        padding-left: 16px;
+      }
+      .frame pre {
+        margin: 4px 0 0;
+        max-height: 180px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font: 10px/1.35 ui-monospace, monospace;
+        background: #8881;
+        padding: 6px;
+        border-radius: 4px;
+      }
+      .url {
+        word-break: break-all;
+      }
+      #debug-copy {
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>PrimeCatParty</h1>
+
+    <section id="not-prime" hidden>
+      <p class="muted">Bir Prime Video sekmesi açıp tekrar dene.</p>
+    </section>
+
+    <section id="lobby" hidden>
+      <button id="create" class="primary full">Oda oluştur</button>
+      <p class="muted or">ya da</p>
+      <form id="join-form" class="row">
+        <input id="join-code" type="text" placeholder="Oda kodu" maxlength="8" autocomplete="off" spellcheck="false" />
+        <button type="submit">Katıl</button>
+      </form>
+      <p id="join-error" class="error" hidden>Oda kodu 8 karakter olmalı (a-z, 0-9).</p>
+    </section>
+
+    <section id="room" hidden>
+      <div class="row">
+        <span id="room-code" class="code"></span>
+        <button id="copy">Kopyala</button>
+      </div>
+      <dl>
+        <dt>Durum</dt>
+        <dd id="connection"><span class="dot"></span><span id="connection-label"></span></dd>
+        <dt>Kişi</dt>
+        <dd id="peers">–</dd>
+        <dt>Rol</dt>
+        <dd id="role">–</dd>
+        <dt>Fark</dt>
+        <dd id="drift">–</dd>
+      </dl>
+      <ul id="warnings" class="warnings"></ul>
+      <button id="leave" class="danger full">Ayrıl</button>
+    </section>
+
+    <details>
+      <summary>Ayarlar</summary>
+      <label>
+        Sunucu adresi
+        <input id="server-url" type="text" class="full" spellcheck="false" />
+      </label>
+      <label><input id="overlay" type="checkbox" /> Sayfada durum göstergesi</label>
+    </details>
+
+    <details id="debug" hidden>
+      <summary>Hata ayıklama</summary>
+      <button id="debug-copy">Bilgiyi kopyala</button>
+      <div id="debug-frames"></div>
+    </details>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
