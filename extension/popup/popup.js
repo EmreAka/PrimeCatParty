@@ -59,7 +59,7 @@ async function render() {
   const rawStatus = all[`status:${tabId}`] ?? null;
   debugSnapshot = { tabId, roomId, status: rawStatus, frames, staleFrames };
 
-  renderDebug(frames, staleFrames);
+  renderDebug(frames, staleFrames, rawStatus);
 
   $("lobby").hidden = Boolean(roomId);
   $("room").hidden = !roomId;
@@ -87,9 +87,29 @@ async function render() {
   $("warnings").replaceChildren(...(status?.warnings ?? []).map((text) => element("li", text)));
 }
 
-function renderDebug(frames, staleFrames) {
+function renderDebug(frames, staleFrames, status) {
   const staleNote = staleFrames ? [element("p", `${staleFrames} eski sayfa kaydı gizlendi.`, "muted")] : [];
   if (frames.length === 0) {
+    // The status channel works independently, so fall back to what it carries.
+    if (status?.logs?.length) {
+      const container = element("div", null, "frame");
+      container.append(
+        element("strong", "Durum kaydından"),
+        ` · heartbeat: ${status.heartbeat ?? "–"} · karşıdan: ${
+          status.peerHeartbeatAgeS === null || status.peerHeartbeatAgeS === undefined
+            ? "hiç gelmedi"
+            : `${status.peerHeartbeatAgeS} sn önce`
+        }`,
+      );
+      if (status.lastError) container.append(element("div", `Son hata: ${status.lastError}`, "error"));
+      container.append(element("pre", status.logs.join("\n")));
+      $("debug-frames").replaceChildren(
+        element("p", "Çerçeve kaydı gelmedi, durum kaydındaki bilgiler gösteriliyor.", "muted"),
+        ...staleNote,
+        container,
+      );
+      return;
+    }
     $("debug-frames").replaceChildren(
       element("p", "Hiçbir çerçeveden bilgi gelmedi: içerik betiği bu sekmede çalışmıyor. Sekmeyi yenile.", "muted"),
       ...staleNote,

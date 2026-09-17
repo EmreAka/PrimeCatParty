@@ -51,10 +51,16 @@
   const DIAG_REFRESH_MS = 10000;
   const documentId = crypto.randomUUID();
   let lastSearchKey = null;
+  let lastHeartbeatBlocker = null;
+  let lastError = null;
   let stopped = false;
   const intervals = [];
 
-  const player = new Player({ onEvent: onPlayerEvent, onVideoChange, onAdChange });
+  const player = new Player({
+    onEvent: guard("player olayı", onPlayerEvent),
+    onVideoChange: guard("video değişimi", onVideoChange),
+    onAdChange: guard("reklam değişimi", onAdChange),
+  });
   const clock = new ClockSync((t0) => transport?.send({ type: "ping", t0 }) ?? false);
   const drift = new DriftController({
     player,
@@ -81,14 +87,16 @@
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
 
     player.start();
+    // Each step is guarded separately so one throwing step can't silently stop the others.
+    const tick = [
+      guard("hata ayıklama kaydı", sendDiagnostics),
+      guard("içerik kontrolü", checkContent),
+      guard("video arama logu", logVideoSearch),
+      guard("durum raporu", report),
+    ];
     intervals.push(
-      setInterval(sendHeartbeat, HEARTBEAT_MS),
-      setInterval(() => {
-        checkContent();
-        logVideoSearch();
-        report();
-        sendDiagnostics();
-      }, CONTENT_CHECK_MS),
+      setInterval(guard("heartbeat", sendHeartbeat), HEARTBEAT_MS),
+      setInterval(() => tick.forEach((step) => step()), CONTENT_CHECK_MS),
     );
     globalThis.navigation?.addEventListener("navigatesuccess", () => checkContent());
     addEventListener("pagehide", () => {
@@ -100,6 +108,18 @@
     if (stopped) return;
     log(`arka plandan oda: ${response?.roomId ?? "yok"}`);
     setRoom(response?.roomId ?? null);
+  }
+
+  function guard(label, fn) {
+    return (...args) => {
+      try {
+        return fn(...args);
+      } catch (err) {
+        lastError = `${label}: ${err?.message ?? err}`;
+        console.error(`[PrimeCatParty] ${label} hatası`, err);
+        log(`HATA ${lastError}`);
+      }
+    };
   }
 
   function onRuntimeMessage(message) {
@@ -115,6 +135,7 @@
       hostId: null,
       peers: 0,
       members: new Map(), // clientId -> name
+      lastPeerHeartbeatAt: null,
       lastStateFix: -Infinity,
       pendingState: null,
       needsInitialHeartbeat: false,
@@ -176,8 +197,8 @@
     log(`odaya bağlanılıyor: ${roomId} (${settings.serverUrl})`);
     transport = new Transport(settings.serverUrl, {
       onOpen,
-      onMessage,
-      onStatus: onTransportStatus,
+      onMessage: (msg) => guard(`mesaj ${msg?.type}`, onMessage)(msg),
+      onStatus: guard("bağlantı durumu", onTransportStatus),
     });
     transport.connect();
   }
@@ -442,10 +463,25 @@
 
   // ---- Heartbeats & drift ------------------------------------------------------
 
-  function sendHeartbeat() {
+  // Why heartbeats are not being sent right now, or null if they are.
+  function heartbeatBlocker() {
     const video = player.video;
-    if (!session.joined || !video || !clock.usable) return;
-    if (player.adActive || session.autoPaused || session.bufferingReported || video.seeking) return;
+    if (!session.joined) return "odada değil";
+    if (!video) return "video yok";
+    if (!clock.usable) return "saat senkronu bekleniyor";
+    if (player.adActive) return "reklam oynuyor";
+    if (session.autoPaused) return "diğerleri bekleniyor";
+    if (session.bufferingReported) return "yükleniyor";
+    if (video.seeking) return "sarılıyor";
+    return null;
+  }
+
+  function sendHeartbeat() {
+    const blocker = heartbeatBlocker();
+    if (blocker !== lastHeartbeatBlocker) log(blocker ? `heartbeat gönderilmiyor: ${blocker}` : "heartbeat gönderiliyor");
+    lastHeartbeatBlocker = blocker;
+    if (blocker) return;
+    const video = player.video;
     transport.send({
       type: "heartbeat",
       clientId,
@@ -458,6 +494,7 @@
   }
 
   function onHeartbeat(msg) {
+    session.lastPeerHeartbeatAt = performance.now();
     const video = player.video;
     if (!video || !clock.usable) return;
     session.peerDrift.set(msg.clientId, video.currentTime - expectedPosition(msg, clock.now()));
@@ -767,6 +804,12 @@
       driftMs: currentDriftMs(),
       rttMs: clock.rtt === null ? null : Math.round(clock.rtt),
       warnings: collectWarnings(),
+      heartbeat: session.joined ? (heartbeatBlocker() ?? "gönderiliyor") : null,
+      peerHeartbeatAgeS:
+        session.lastPeerHeartbeatAt === null ? null : Math.round((performance.now() - session.lastPeerHeartbeatAt) / 1000),
+      lastError,
+      // Also carried here because status reaches the popup even when the debug snapshot doesn't.
+      logs: PCP.logs.slice(-20),
     };
     overlay.update(status);
 
