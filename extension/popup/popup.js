@@ -11,6 +11,9 @@ const CONNECTION_LABELS = {
   error: "Kopuk",
 };
 
+const DIAG_STALE_MS = 25000;
+const RERENDER_MS = 5000;
+
 const $ = (id) => document.getElementById(id);
 
 let tabId = null;
@@ -38,20 +41,25 @@ async function init() {
     );
     if (relevant) render();
   });
+  // Re-render periodically so records age out even when storage is quiet.
+  setInterval(render, RERENDER_MS);
   await render();
 }
 
 async function render() {
   const all = await chrome.storage.session.get(null);
   roomId = all[`room:${tabId}`] ?? null;
-  const frames = Object.entries(all)
+  const records = Object.entries(all)
     .filter(([key]) => key.startsWith(`diag:${tabId}:`))
     .map(([, value]) => value)
     .sort((a, b) => a.frameId - b.frameId);
+  // Live frames resend every 10 s; anything quieter belongs to a page that is gone.
+  const frames = records.filter((frame) => Date.now() - (frame.updatedAt ?? 0) < DIAG_STALE_MS);
+  const staleFrames = records.length - frames.length;
   const rawStatus = all[`status:${tabId}`] ?? null;
-  debugSnapshot = { tabId, roomId, status: rawStatus, frames };
+  debugSnapshot = { tabId, roomId, status: rawStatus, frames, staleFrames };
 
-  renderDebug(frames);
+  renderDebug(frames, staleFrames);
 
   $("lobby").hidden = Boolean(roomId);
   $("room").hidden = !roomId;
@@ -79,14 +87,17 @@ async function render() {
   $("warnings").replaceChildren(...(status?.warnings ?? []).map((text) => element("li", text)));
 }
 
-function renderDebug(frames) {
+function renderDebug(frames, staleFrames) {
+  const staleNote = staleFrames ? [element("p", `${staleFrames} eski sayfa kaydı gizlendi.`, "muted")] : [];
   if (frames.length === 0) {
     $("debug-frames").replaceChildren(
       element("p", "Hiçbir çerçeveden bilgi gelmedi: içerik betiği bu sekmede çalışmıyor. Sekmeyi yenile.", "muted"),
+      ...staleNote,
     );
     return;
   }
   $("debug-frames").replaceChildren(
+    ...staleNote,
     ...frames.map((frame) => {
       const container = element("div", null, "frame");
       const connection = frame.connection + (frame.detail ? ` (${frame.detail})` : "");

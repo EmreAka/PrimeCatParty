@@ -29,7 +29,6 @@
   const VIDEO_LOST_GRACE_MS = 15000;
   const BUFFER_REPORT_DELAY_MS = 500;
   const CONTENT_CHECK_MS = 1000;
-  const DURATION_TOLERANCE_S = 2;
   const LOCAL_CONTROL_EVENTS = new Set(["play", "pause", "seeking", "seeked", "ratechange"]);
 
   const clientId = crypto.randomUUID();
@@ -48,6 +47,9 @@
   let reported = false;
   let lastReportKey = null;
   let lastDiagKey = null;
+  let lastDiagSentAt = -Infinity;
+  const DIAG_REFRESH_MS = 10000;
+  const documentId = crypto.randomUUID();
   let lastSearchKey = null;
   let stopped = false;
   const intervals = [];
@@ -712,19 +714,16 @@
     return pathname.match(/\/detail\/([^/]+)/)?.[1] ?? pathname;
   }
 
-  // The URL alone doesn't change between episodes of a season, so duration is part of the identity.
+  // Identity is the URL's content id only. Duration can't be used: Prime stitches ads into the
+  // stream, so the same title reports different durations per viewer (seen: 4888 vs 4905 s).
+  // Duration is still sent, for logs only.
   function checkContent(force = false) {
     if (!player.video) return;
     const duration = Number.isFinite(player.contentDuration) ? Math.round(player.contentDuration) : 0;
     const next = { contentId: readContentId(), duration };
-    const changed =
-      !localContent ||
-      next.contentId !== localContent.contentId ||
-      Math.abs(next.duration - localContent.duration) > DURATION_TOLERANCE_S;
-    if (changed) {
-      localContent = next;
-      log("içerik:", next);
-    }
+    const changed = !localContent || next.contentId !== localContent.contentId;
+    localContent = next;
+    if (changed) log("içerik:", next);
     if ((changed || force) && session.joined) {
       transport.send({ type: "contentChanged", clientId, name: myName(), ...localContent });
     }
@@ -735,7 +734,7 @@
     const previous = session.peerContent.get(msg.clientId);
     const next = { contentId: msg.contentId, duration: msg.duration };
     session.peerContent.set(msg.clientId, next);
-    const changed = !previous || previous.contentId !== next.contentId || previous.duration !== next.duration;
+    const changed = !previous || previous.contentId !== next.contentId;
     if (changed && !sameContent(next, localContent)) {
       const name = nameOf(msg.clientId, msg.name);
       log(`${name} başka bir bölümde`, msg);
@@ -746,8 +745,7 @@
 
   function sameContent(a, b) {
     if (!a || !b) return true;
-    if (a.contentId !== b.contentId) return false;
-    return !a.duration || !b.duration || Math.abs(a.duration - b.duration) <= DURATION_TOLERANCE_S;
+    return a.contentId === b.contentId;
   }
 
   function contentMatches(peerId) {
@@ -839,9 +837,11 @@
       logs: PCP.logs.slice(-25),
     };
     const key = JSON.stringify(diag);
-    if (key === lastDiagKey) return;
+    // Resend unchanged snapshots now and then: the popup treats silent frames as stale.
+    if (key === lastDiagKey && performance.now() - lastDiagSentAt < DIAG_REFRESH_MS) return;
     lastDiagKey = key;
-    sendToBackground({ type: "diag", diag });
+    lastDiagSentAt = performance.now();
+    sendToBackground({ type: "diag", diag: { ...diag, documentId } });
   }
 
   function sendToBackground(message) {

@@ -91,8 +91,18 @@ async function updateStatus(tabId, status) {
 
 async function updateDiagnostics(tabId, frameId, diag) {
   const key = `${diagPrefix(tabId)}${frameId}`;
-  if (diag) await chrome.storage.session.set({ [key]: { ...diag, frameId } });
-  else await chrome.storage.session.remove(key);
+  if (!diag) {
+    await chrome.storage.session.remove(key);
+    return;
+  }
+  // A new top-level document means every record from the previous page is gone.
+  if (frameId === 0) {
+    const previous = (await chrome.storage.session.get(key))[key];
+    if (previous && previous.documentId !== diag.documentId) {
+      await chrome.storage.session.remove(await diagKeys(tabId));
+    }
+  }
+  await chrome.storage.session.set({ [key]: { ...diag, frameId, updatedAt: Date.now() } });
 }
 
 async function diagKeys(tabId) {
