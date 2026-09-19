@@ -5,9 +5,9 @@
   PCP.shutdown?.();
   PCP.shutdown = shutdown;
 
-  const { Transport, ClockSync, DriftController, Player, Overlay, expectedPosition, log } = PCP;
+  const { Transport, ClockSync, DriftController, Player, Overlay, Chat, expectedPosition, log } = PCP;
 
-  const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true, notifications: true, displayName: "" };
+  const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true, notifications: true, chat: true, displayName: "" };
   // Time window, not a flag: `seeked` can arrive 200-300 ms after a remote seek is applied.
   const SUPPRESS_MS = 400;
   // After we play/pause on someone's behalf, Prime may revert it. Within this window, play/pause
@@ -69,6 +69,9 @@
     hardSeek: (position) => seekFromRemote(position),
   });
   const overlay = new Overlay();
+  const chat = new Chat();
+  chat.setSelf(clientId);
+  chat.onSend = sendChat;
 
   clock.onReady = () => {
     afterClockSync();
@@ -83,6 +86,7 @@
     if (stopped) return;
     log(`ayarlar: sunucu ${settings.serverUrl}, gösterge ${settings.overlay ? "açık" : "kapalı"}`);
     overlay.setEnabled(settings.overlay);
+    chat.setEnabled(settings.chat);
     chrome.storage.onChanged.addListener(onSettingsChanged);
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
 
@@ -159,6 +163,10 @@
       settings.overlay = changes.overlay.newValue ?? DEFAULT_SETTINGS.overlay;
       overlay.setEnabled(settings.overlay);
     }
+    if (changes.chat) {
+      settings.chat = changes.chat.newValue ?? DEFAULT_SETTINGS.chat;
+      chat.setEnabled(settings.chat);
+    }
     if (changes.notifications) {
       settings.notifications = changes.notifications.newValue ?? DEFAULT_SETTINGS.notifications;
     }
@@ -180,6 +188,7 @@
     if (next === roomId) return;
     disconnect();
     roomId = next;
+    chat.clear();
     if (!roomId) log("odadan ayrılındı");
     connectIfReady();
     report();
@@ -255,6 +264,11 @@
         return onRemoteBuffering(msg);
       case "contentChanged":
         return onRemoteContent(msg);
+      case "chat":
+        return showChat(msg);
+      case "chatRejected":
+        log(`sohbet mesajı sunucuda reddedildi (${msg.reason})`);
+        return overlay.notify("Çok hızlı yazıyorsun, son mesajın gitmedi");
     }
   }
 
@@ -268,6 +282,8 @@
       needsInitialHeartbeat: !msg.state,
     });
     updateMembers(msg.members);
+    // After a reconnect this replays what we already have; the chat drops duplicate ids.
+    if (Array.isArray(msg.chat)) msg.chat.forEach(showChat);
     clock.seed(msg.t1);
     log(`odaya katılındı: ${msg.peers} kişi, ${msg.isHost ? "host" : "misafir"}`);
     const others = [...session.members].filter(([id]) => id !== clientId).map(([, name]) => name);
@@ -354,6 +370,28 @@
   function announceLocalHolds() {
     if (player.adActive) transport?.send({ type: "adBreak", clientId, name: myName(), active: true });
     if (session.bufferingReported) transport?.send({ type: "buffering", clientId, active: true });
+  }
+
+  // ---- Chat ----------------------------------------------------------------------
+
+  // Returning false keeps the text in the composer so the user can retry.
+  function sendChat(text) {
+    if (!session.joined) return false;
+    const message = { type: "chat", id: crypto.randomUUID(), clientId, text };
+    if (!transport.send(message)) return false;
+    chat.addMessage({ ...message, name: myName(), at: Date.now(), self: true });
+    return true;
+  }
+
+  function showChat(msg) {
+    chat.addMessage({
+      id: msg.id,
+      clientId: msg.clientId,
+      name: msg.name || nameOf(msg.clientId),
+      text: msg.text,
+      at: msg.at,
+      self: msg.clientId === clientId,
+    });
   }
 
   // ---- Echo suppression & applying remote state --------------------------------
@@ -812,6 +850,7 @@
       logs: PCP.logs.slice(-20),
     };
     overlay.update(status);
+    chat.setActive(Boolean(status.roomId && status.hasVideo));
 
     if (!status.hasVideo && !transport && !reported) return;
     const key = JSON.stringify(status);
@@ -905,6 +944,7 @@
     endSession();
     player.stop();
     overlay.setEnabled(false);
+    chat.destroy();
     try {
       chrome.storage.onChanged.removeListener(onSettingsChanged);
       chrome.runtime.onMessage.removeListener(onRuntimeMessage);

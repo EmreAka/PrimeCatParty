@@ -7,7 +7,7 @@ export const CLOSE_INVALID = 4000;
 export const CLOSE_FULL = 4001;
 
 export class Rooms {
-  #rooms = new Map(); // roomId -> { clients: Set, state, host }
+  #rooms = new Map(); // roomId -> { clients: Set, state, host, chat: [] }
 
   get size() {
     return this.#rooms.size;
@@ -27,7 +27,7 @@ export class Rooms {
     if (room && room.clients.size >= MAX_CLIENTS) return { error: CLOSE_FULL };
     const created = !room;
     if (!room) {
-      room = { clients: new Set(), state: null, host: ws };
+      room = { clients: new Set(), state: null, host: ws, chat: [] };
       this.#rooms.set(roomId, room);
     }
     room.clients.add(ws);

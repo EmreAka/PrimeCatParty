@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PrimeCatParty",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Prime Video'yu arkadaşlarınla senkron izle.",
   "host_permissions": ["https://www.primevideo.com/*"],
   "permissions": ["storage", "tabs", "scripting"],
@@ -21,6 +21,7 @@
         "content/sync.js",
         "content/player.js",
         "content/overlay.js",
+        "content/chat.js",
         "content/main.js"
       ],
       "all_frames": true,

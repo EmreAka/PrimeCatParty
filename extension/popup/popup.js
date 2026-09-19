@@ -1,4 +1,4 @@
-const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true, notifications: true, displayName: "" };
+const DEFAULT_SETTINGS = { serverUrl: "ws://localhost:8080", overlay: true, notifications: true, chat: true, displayName: "" };
 const PRIME_URL = /^https:\/\/www\.primevideo\.com\//;
 const ROOM_ID = /^[a-z0-9]{8}$/;
 
@@ -182,10 +182,12 @@ async function initSettings() {
   const serverInput = $("server-url");
   const overlayInput = $("overlay");
   const notificationsInput = $("notifications");
+  const chatInput = $("chat");
   const nameInput = $("display-name");
   serverInput.value = settings.serverUrl;
   overlayInput.checked = settings.overlay;
   notificationsInput.checked = settings.notifications;
+  chatInput.checked = settings.chat;
   nameInput.value = settings.displayName;
 
   let nameTimer = null;
@@ -209,6 +211,7 @@ async function initSettings() {
     if (valid) chrome.storage.local.set({ serverUrl: value });
   });
   overlayInput.addEventListener("change", () => chrome.storage.local.set({ overlay: overlayInput.checked }));
+  chatInput.addEventListener("change", () => chrome.storage.local.set({ chat: chatInput.checked }));
 }
 
 function isWebSocketUrl(value) {

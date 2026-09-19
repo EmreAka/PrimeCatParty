@@ -206,4 +206,6 @@
   }
 
   PCP.Overlay = Overlay;
+  PCP.mountTarget = mountTarget;
+  PCP.createShadowHost = createShadowHost;
 })();

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { Rooms, broadcast, CLOSE_INVALID, CLOSE_FULL, MAX_CLIENTS } from "./rooms.js";
 
@@ -28,6 +29,13 @@ function log(...args) {
 }
 
 const MAX_NAME_LENGTH = 32;
+const MAX_CHAT_LENGTH = 300;
+// Kept per room so a late joiner or a reconnect sees the recent conversation.
+const CHAT_HISTORY = 30;
+// Token bucket per connection: a burst of CHAT_BURST, then one message per CHAT_REFILL_MS.
+const CHAT_BURST = 5;
+const CHAT_REFILL_MS = 1000;
+const CHAT_ID = /^[\w-]{1,64}$/;
 
 // "#3 emre (1a2b3c4d)" — connection number, display name, start of the client id.
 function who(ws) {
@@ -36,6 +44,33 @@ function who(ws) {
 }
 
 const cleanName = (name) => (typeof name === "string" ? name.trim().slice(0, MAX_NAME_LENGTH) : "");
+
+function takeChatToken(ws) {
+  const t = now();
+  ws.chatTokens = Math.min(CHAT_BURST, (ws.chatTokens ?? CHAT_BURST) + (t - (ws.chatRefilledAt ?? t)) / CHAT_REFILL_MS);
+  ws.chatRefilledAt = t;
+  if (ws.chatTokens < 1) return false;
+  ws.chatTokens -= 1;
+  return true;
+}
+
+// Name and time come from the server so nobody can speak as someone else. The id is the
+// sender's, so its own copy (shown right away) and the history replay deduplicate.
+function onChat(ws, room, msg) {
+  const text = typeof msg.text === "string" ? msg.text.trim().slice(0, MAX_CHAT_LENGTH) : "";
+  if (!text) return;
+  const id = typeof msg.id === "string" && CHAT_ID.test(msg.id) ? msg.id : randomUUID();
+  if (!takeChatToken(ws)) {
+    log(`${who(ws)} çok hızlı yazıyor, sohbet mesajı atlandı`);
+    return send(ws, { type: "chatRejected", id, reason: "rate" });
+  }
+  const chat = { type: "chat", id, clientId: ws.clientId, name: ws.name, text, at: Date.now() };
+  room.chat.push(chat);
+  if (room.chat.length > CHAT_HISTORY) room.chat.shift();
+  // Only the length is logged; the conversation itself stays out of the server logs.
+  log(`${who(ws)} → ${ws.roomId}: sohbet (${text.length} karakter) (${room.clients.size - 1} kişiye)`);
+  broadcast(room, JSON.stringify(chat), ws);
+}
 
 const membersOf = (room) => [...room.clients].map((ws) => ({ clientId: ws.clientId, name: ws.name }));
 
@@ -121,6 +156,7 @@ wss.on("connection", (ws, req) => {
         peers: room.clients.size,
         members: membersOf(room),
         state: room.state,
+        chat: room.chat,
         t1: now(),
       });
       broadcast(
@@ -151,6 +187,7 @@ wss.on("connection", (ws, req) => {
       broadcast(room, JSON.stringify({ type: "members", members: membersOf(room), hostId: room.host.clientId }));
       return;
     }
+    if (msg.type === "chat") return onChat(ws, room, msg);
     if (!RELAYED_TYPES.has(msg.type)) {
       log(`${who(ws)} bilinmeyen mesaj: ${msg.type}`);
       return;

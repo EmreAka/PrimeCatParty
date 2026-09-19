@@ -21,6 +21,7 @@ Biri durdurunca, devam ettirince ya da sarınca odadaki herkesin videosu aynı y
 - **Reklam arası:** Birinde reklam başlarsa diğerleri bekler, herkes reklamdan çıkınca devam edilir.
 - **Buffer beklemesi:** Birinin videosu yükleniyorsa diğerleri durup onu bekler.
 - **İçerik kontrolü:** Biri farklı bir diziye veya filme geçerse (URL'deki içerik kimliği değişirse) uyarı çıkar ve senkron durur.
+- **Sohbet:** Oda açıkken videonun üstünde, altyazı gibi görünen bir sohbet var. Enter ile yazılır, satırlar birkaç saniye sonra kaybolur, Enter yine geçmişi açar. Sonradan gelen son 30 mesajı görür. **Ayarlar**'dan kapatılabilir.
 - **Geç katılma:** Sonradan gelen, odanın son durumuna tek hamlede senkronlanır.
 - **Yeniden bağlanma:** Bağlantı koparsa 1, 2, 4… saniye aralıklarla (en fazla 30 sn) yeniden denenir.
 
@@ -36,6 +37,7 @@ extension/                 Chrome eklentisi
     sync.js                saat senkronu ve kayma düzeltmesi
     player.js              <video> bulma, olay yakalama, oynat/durdur/sar
     overlay.js             durum göstergesi ve ekran bildirimleri
+    chat.js                videonun üstündeki sohbet arayüzü
     main.js                hepsini birbirine bağlayan kısım
   popup/
     popup.html / popup.js  isim, oda oluştur/katıl, durum, ayarlar, hata ayıklama
@@ -147,7 +149,7 @@ Tüm mesajlar JSON'dur. `position` saniye cinsinden video konumu, `at` ise gönd
 | Yön | Mesaj | Alanlar |
 | --- | --- | --- |
 | → | `join` | `roomId`, `clientId`, `name` |
-| ← | `joined` | `isHost`, `hostId`, `peers`, `members`, `state`, `t1` |
+| ← | `joined` | `isHost`, `hostId`, `peers`, `members`, `state`, `chat`, `t1` |
 | ↔ | `ping` / `pong` | `t0`, `t1` |
 | → | `control` | `action` (`play` / `pause` / `seek` / `rate`), `position`, `playing`, `rate`, `at`, `name` |
 | ↔ | `heartbeat` | `position`, `playing`, `rate`, `at`, `fromHost` |
@@ -155,10 +157,14 @@ Tüm mesajlar JSON'dur. `position` saniye cinsinden video konumu, `at` ise gönd
 | → | `buffering` | `active` |
 | → | `contentChanged` | `contentId`, `duration`, `name` |
 | → | `rename` | `name` |
+| ↔ | `chat` | `id`, `text`; sunucudan gelirken ayrıca `name`, `at` |
+| ← | `chatRejected` | `id`, `reason` (`rate`) |
 | ← | `peerJoined` / `peerLeft` | `clientId`, `name`, `peers`, `hostId`, `members` |
 | ← | `members` | `members`, `hostId` |
 
 İstemcinin gönderdiği mesajlarda ayrıca `clientId` bulunur. Sunucu mesajları gönderen hariç odadakilere olduğu gibi iletir. Son `control` mesajını ve host'un son `heartbeat`'ini odanın durumu olarak saklar; geç katılana `joined` içinde bu durum gönderilir.
+
+`chat` mesajları olduğu gibi iletilmez: sunucu metni kırpar (en fazla 300 karakter), ismi ve zamanı (`at`, duvar saati, ms) kendisi ekler ve odanın son 30 mesajını `joined` içindeki `chat` listesinde gönderir. Kişi başına 5 mesajlık bir patlamadan sonra saniyede bir mesaja izin verilir, fazlası `chatRejected` ile geri çevrilir. Sunucu loglarına mesajların içeriği değil, yalnızca uzunluğu yazılır.
 
 Sunucunun bağlantıyı kapatma kodları: `4000` geçersiz oda kodu veya istemci, `4001` oda dolu.
 
